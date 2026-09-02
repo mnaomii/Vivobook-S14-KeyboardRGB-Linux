@@ -1,0 +1,14 @@
+[Unit]
+Description=Keyboard RGB effect daemon
+Documentation=man:hid(4)
+PartOf=graphical-session.target
+After=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/kbdrgbd
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=graphical-session.target

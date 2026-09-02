@@ -1,0 +1,240 @@
+#!/usr/bin/env python3
+"""Keyboard RGB - Adwaita front-end for the ASUS ITE5570 LampArray.
+
+Writes ~/.config/kbdrgb/state.json; kbdrgbd owns the device and renders it.
+That split is what lets an effect keep running after this window is closed.
+"""
+import colorsys, json, os, sys
+import gi
+gi.require_version("Gtk", "4.0")
+gi.require_version("Adw", "1")
+from gi.repository import Adw, Gdk, Gio, GLib, Gtk
+
+STATE = os.path.expanduser("~/.config/kbdrgb/state.json")
+UNIT = "kbdrgb.service"
+
+
+def load_state():
+    try:
+        with open(STATE) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {"mode": "solid", "color": [0, 170, 255], "intensity": 255,
+                "seconds": 8.0}
+
+
+def save_state(st):
+    os.makedirs(os.path.dirname(STATE), exist_ok=True)
+    tmp = STATE + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(st, f)
+    os.replace(tmp, STATE)          # atomic: daemon never sees a half file
+
+
+def run(*argv):
+    try:
+        p = Gio.Subprocess.new(argv, Gio.SubprocessFlags.STDOUT_PIPE |
+                               Gio.SubprocessFlags.STDERR_MERGE)
+        ok, out, _ = p.communicate_utf8(None, None)
+        return p.get_exit_status(), (out or "").strip()
+    except GLib.Error as e:
+        return 1, e.message
+
+
+class Window(Adw.ApplicationWindow):
+    def __init__(self, app):
+        super().__init__(application=app, title="Keyboard RGB",
+                         default_width=440, default_height=620)
+        self.st = load_state()
+        self.loading = True
+        self.preview_phase = 0.0
+
+        self.toasts = Adw.ToastOverlay()
+        view = Adw.ToolbarView()
+        view.add_top_bar(Adw.HeaderBar())
+        self.toasts.set_child(view)
+        self.set_content(self.toasts)
+        page = Adw.PreferencesPage()
+        view.set_content(page)
+
+        # ---- preview -------------------------------------------------------
+        self.preview = Gtk.Box(height_request=64, margin_top=6, margin_bottom=6)
+        self.preview.set_name("kbpreview")
+        self.css = Gtk.CssProvider()
+        Gtk.StyleContext.add_provider_for_display(
+            Gdk.Display.get_default(), self.css, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+        gp = Adw.PreferencesGroup(title="Preview")
+        gp.add(self.preview)
+        page.add(gp)
+
+        # ---- daemon status -------------------------------------------------
+        gd = Adw.PreferencesGroup()
+        self.status = Adw.ActionRow(title="Effect daemon", subtitle="checking...")
+        self.sw = Gtk.Switch(valign=Gtk.Align.CENTER)
+        self.sw.connect("notify::active", self.on_daemon_toggle)
+        self.status.add_suffix(self.sw)
+        gd.add(self.status)
+        page.add(gd)
+
+        # ---- mode ----------------------------------------------------------
+        gm = Adw.PreferencesGroup()
+        self.mode = Adw.ComboRow(title="Mode",
+                                 model=Gtk.StringList.new(
+                                     ["Solid colour", "Rainbow wave",
+                                      "Off", "Firmware animation"]))
+        self.mode.connect("notify::selected", self.on_change)
+        gm.add(self.mode)
+        page.add(gm)
+
+        # ---- solid ---------------------------------------------------------
+        self.gsolid = Adw.PreferencesGroup(title="Colour")
+        row = Adw.ActionRow(title="Pick", subtitle="Full wheel and custom values")
+        self.btn = Gtk.ColorDialogButton(dialog=Gtk.ColorDialog(with_alpha=False),
+                                         valign=Gtk.Align.CENTER)
+        self.btn.connect("notify::rgba", self.on_pick)
+        row.add_suffix(self.btn)
+        self.gsolid.add(row)
+        self.hexrow = Adw.EntryRow(title="Hex")
+        self.hexrow.set_show_apply_button(True)
+        self.hexrow.connect("apply", self.on_hex)
+        self.gsolid.add(self.hexrow)
+        page.add(self.gsolid)
+
+        # ---- wave ----------------------------------------------------------
+        self.gwave = Adw.PreferencesGroup(
+            title="Wave", description="Full hue circle, looping. Keeps running "
+                                      "after you close this window.")
+        self.speed = Adw.SpinRow.new_with_range(1, 120, 1)
+        self.speed.set_title("Seconds per rotation")
+        self.speed.connect("notify::value", self.on_change)
+        self.gwave.add(self.speed)
+        page.add(self.gwave)
+
+        # ---- intensity -----------------------------------------------------
+        gi_ = Adw.PreferencesGroup()
+        self.inten = Adw.SpinRow.new_with_range(0, 255, 5)
+        self.inten.set_title("Intensity")
+        self.inten.set_subtitle("Fn+F3/F4 still sets overall backlight brightness")
+        self.inten.connect("notify::value", self.on_change)
+        gi_.add(self.inten)
+        page.add(gi_)
+
+        # ---- start at login ------------------------------------------------
+        gl = Adw.PreferencesGroup()
+        self.autostart = Adw.SwitchRow(
+            title="Restore at login",
+            subtitle="Enable the daemon as a user service")
+        self.autostart.connect("notify::active", self.on_autostart)
+        gl.add(self.autostart)
+        page.add(gl)
+
+        # populate from saved state
+        self.mode.set_selected({"solid": 0, "wave": 1, "off": 2, "auto": 3}
+                               .get(self.st.get("mode", "solid"), 0))
+        c = Gdk.RGBA()
+        r, g, b = self.st.get("color", [0, 170, 255])
+        c.parse("#%02x%02x%02x" % (r, g, b))
+        self.btn.set_rgba(c)
+        self.hexrow.set_text("#%02x%02x%02x" % (r, g, b))
+        self.speed.set_value(float(self.st.get("seconds", 8.0)))
+        self.inten.set_value(float(self.st.get("intensity", 255)))
+        self.loading = False
+
+        self.refresh_daemon()
+        self.sync_visibility()
+        GLib.timeout_add(1000 // 30, self.animate_preview)
+
+    # -- daemon ---------------------------------------------------------------
+    def refresh_daemon(self):
+        active = run("systemctl", "--user", "is-active", UNIT)[1] == "active"
+        enabled = run("systemctl", "--user", "is-enabled", UNIT)[1] == "enabled"
+        self.loading = True
+        self.sw.set_active(active)
+        self.autostart.set_active(enabled)
+        self.loading = False
+        self.status.set_subtitle("Running - effects persist"
+                                 if active else "Stopped - nothing is driving the LEDs")
+
+    def on_daemon_toggle(self, *_):
+        if self.loading:
+            return
+        verb = "start" if self.sw.get_active() else "stop"
+        code, out = run("systemctl", "--user", verb, UNIT)
+        if code:
+            self.toasts.add_toast(Adw.Toast(title=out or f"could not {verb} daemon"))
+        GLib.timeout_add(400, lambda: (self.refresh_daemon(), False)[1])
+
+    def on_autostart(self, *_):
+        if self.loading:
+            return
+        verb = "enable" if self.autostart.get_active() else "disable"
+        code, out = run("systemctl", "--user", verb, UNIT)
+        if code:
+            self.toasts.add_toast(Adw.Toast(title=out or f"could not {verb}"))
+
+    # -- state ----------------------------------------------------------------
+    def sync_visibility(self):
+        m = self.mode.get_selected()
+        self.gsolid.set_visible(m == 0)
+        self.gwave.set_visible(m == 1)
+        self.inten.set_sensitive(m in (0, 1))
+
+    def on_pick(self, *_):
+        c = self.btn.get_rgba()
+        self.hexrow.set_text("#%02x%02x%02x" % (int(c.red * 255), int(c.green * 255),
+                                                int(c.blue * 255)))
+        self.on_change()
+
+    def on_hex(self, *_):
+        c = Gdk.RGBA()
+        if c.parse(self.hexrow.get_text().strip()):
+            self.btn.set_rgba(c)
+        else:
+            self.toasts.add_toast(Adw.Toast(title="Not a colour - try #rrggbb"))
+
+    def on_change(self, *_):
+        if self.loading:
+            return
+        self.sync_visibility()
+        c = self.btn.get_rgba()
+        self.st.update({          # update, so keys we do not expose (fps) survive
+            "mode": ["solid", "wave", "off", "auto"][self.mode.get_selected()],
+            "color": [int(c.red * 255), int(c.green * 255), int(c.blue * 255)],
+            "intensity": int(self.inten.get_value()),
+            "seconds": float(self.speed.get_value()),
+        })
+        save_state(self.st)
+        if not self.sw.get_active():
+            self.toasts.add_toast(Adw.Toast(
+                title="Saved, but the daemon is stopped - turn it on to see it",
+                timeout=4))
+
+    # -- local preview only ---------------------------------------------------
+    def animate_preview(self):
+        m = self.mode.get_selected()
+        if m == 1:
+            self.preview_phase = (self.preview_phase +
+                                  (1 / 30) / max(self.speed.get_value(), 0.1)) % 1.0
+            r, g, b = (int(v * 255) for v in
+                       colorsys.hsv_to_rgb(self.preview_phase, 1, 1))
+        elif m == 2:
+            r = g = b = 0
+        elif m == 3:
+            r, g, b = 60, 60, 60
+        else:
+            c = self.btn.get_rgba()
+            r, g, b = int(c.red * 255), int(c.green * 255), int(c.blue * 255)
+        self.css.load_from_string(
+            f"#kbpreview {{ background: rgb({r},{g},{b}); border-radius: 12px; }}")
+        return GLib.SOURCE_CONTINUE
+
+
+class App(Adw.Application):
+    def __init__(self):
+        super().__init__(application_id="dev.nao.KeyboardRGB")
+
+    def do_activate(self):
+        Window(self).present()
+
+
+sys.exit(App().run(sys.argv))
