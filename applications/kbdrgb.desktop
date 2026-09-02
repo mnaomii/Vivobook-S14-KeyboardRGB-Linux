@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Keyboard RGB
+Comment=Set the keyboard backlight colour and effects
+Exec=kbdrgb-gui
+Icon=preferences-desktop-keyboard
+Terminal=false
+Categories=Settings;HardwareSettings;
+Keywords=keyboard;backlight;rgb;colour;color;led;

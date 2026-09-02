@@ -1,0 +1,129 @@
+#!/usr/bin/env python3
+"""Single-zone RGB control for the ASUS ITE5570 keyboard (HID LampArray).
+
+  kbdrgb.py ff0000              solid red
+  kbdrgb.py "#3aa" -i 128       half intensity
+  kbdrgb.py off                 lamp black (backlight LED stays on)
+  kbdrgb.py auto                give control back to firmware (GRUB rainbow)
+  kbdrgb.py breathe 00aaff      slow pulse until Ctrl-C
+  kbdrgb.py cycle -s 20         full hue rotation, 20 s per turn
+  kbdrgb.py wave 0066ff -c2 aa00ff -s 6\n                                eased sweep between two hues
+"""
+import argparse, colorsys, fcntl, glob, os, struct, sys, time
+
+HID_IDS = (0x0B05, 0x5570)      # the ITE5570 keyboard controller
+
+def find_device():
+    """Resolve the keyboard's hidraw node by HID identity, not by node number.
+
+    hidraw numbering is enumeration order and is not stable: a USB mouse left
+    plugged in across a reboot enumerates first and shifts the keyboard along.
+    """
+    for sysdir in sorted(glob.glob("/sys/class/hidraw/hidraw*")):
+        try:
+            with open(os.path.join(sysdir, "device", "uevent")) as fh:
+                fields = dict(l.split("=", 1) for l in fh.read().splitlines() if "=" in l)
+        except OSError:
+            continue
+        parts = fields.get("HID_ID", "").split(":")
+        try:
+            if len(parts) == 3 and (int(parts[1], 16), int(parts[2], 16)) == HID_IDS:
+                return "/dev/" + os.path.basename(sysdir)
+        except ValueError:
+            continue
+    return None
+RID_RANGE_UPDATE, RID_CONTROL = 0x45, 0x46
+FLAG_UPDATE_COMPLETE = 0x01
+KBD_LED = "/sys/class/leds/asus::kbd_backlight/brightness"
+
+def _ioc(d, t, nr, size): return (d << 30) | (size << 16) | (t << 8) | nr
+def set_feature(fd, payload):
+    buf = bytearray(payload)
+    fcntl.ioctl(fd, _ioc(3, ord('H'), 0x06, len(buf)), buf)
+
+def autonomous(fd, on):
+    """1 = firmware drives the LEDs, 0 = we do."""
+    set_feature(fd, struct.pack("<BB", RID_CONTROL, 1 if on else 0))
+
+def set_rgb(fd, r, g, b, intensity=255):
+    set_feature(fd, struct.pack("<BBHHBBBB", RID_RANGE_UPDATE,
+                                FLAG_UPDATE_COMPLETE, 0, 0, r, g, b, intensity))
+
+def parse_color(s):
+    s = s.lstrip("#")
+    named = {"red":"ff0000","green":"00ff00","blue":"0000ff","white":"ffffff",
+             "cyan":"00ffff","magenta":"ff00ff","yellow":"ffff00",
+             "orange":"ff6600","purple":"8800ff","off":"000000"}
+    s = named.get(s.lower(), s)
+    if len(s) == 3: s = "".join(c * 2 for c in s)
+    if len(s) != 6: raise ValueError(f"bad color: {s}")
+    return tuple(int(s[i:i+2], 16) for i in (0, 2, 4))
+
+def parse_hue(s):
+    r, g, b = parse_color(s)
+    return colorsys.rgb_to_hsv(r / 255, g / 255, b / 255)[0]
+
+def warn_if_dark():
+    try:
+        if int(open(KBD_LED).read().strip()) == 0:
+            print("note: asus::kbd_backlight is 0 — press Fn+F3/F4 or the RGB "
+                  "won't be visible.", file=sys.stderr)
+    except OSError:
+        pass
+
+ap = argparse.ArgumentParser()
+ap.add_argument("mode", help="a color, or: off | auto | breathe | cycle")
+ap.add_argument("color", nargs="?", default="00aaff")
+ap.add_argument("-i", "--intensity", type=int, default=255)
+ap.add_argument("-s", "--seconds", type=float, default=8.0, help="animation period")
+ap.add_argument("-c2", "--color2", default="ff00aa", help="wave end hue")
+ap.add_argument("--fps", type=float, default=60.0)
+ap.add_argument("-d", "--device", default=None,
+                help="override auto-detection of the hidraw node")
+a = ap.parse_args()
+
+dev = a.device or find_device()
+if dev is None:
+    sys.exit("keyboard (0B05:5570) not found — is it an ITE5570 machine?")
+try:
+    fd = open(dev, "rb+")
+except PermissionError:
+    sys.exit(f"no access to {dev} — install the udev rule, or use sudo")
+
+if a.mode == "auto":
+    autonomous(fd, True)
+    print("firmware control restored")
+    sys.exit()
+
+warn_if_dark()
+autonomous(fd, False)          # take the wheel
+
+try:
+    if a.mode == "breathe":
+        r, g, b = parse_color(a.color)
+        while True:                                   # cosine ease, 60 fps
+            t = (time.time() % a.seconds) / a.seconds
+            k = (1 - __import__("math").cos(t * 2 * 3.141592653589793)) / 2
+            set_rgb(fd, r, g, b, int(k * a.intensity))
+            time.sleep(1 / a.fps)
+    elif a.mode in ("cycle", "wave"):
+        # 'wave' sweeps a limited hue arc and eases at the turns, which reads as
+        # a wave washing back and forth; 'cycle' is a plain full-hue rotation.
+        import math
+        h0, h1 = (parse_hue(a.color), parse_hue(a.color2)) if a.mode == "wave" \
+                 else (0.0, 1.0)
+        while True:
+            t = (time.time() % a.seconds) / a.seconds
+            if a.mode == "wave":
+                k = (1 - math.cos(t * 2 * math.pi)) / 2      # ease in/out, ping-pong
+                h = h0 + (h1 - h0) * k
+            else:
+                h = t                                        # linear, wraps cleanly
+            r, g, b = (int(v * 255) for v in colorsys.hsv_to_rgb(h % 1.0, 1, 1))
+            set_rgb(fd, r, g, b, a.intensity)
+            time.sleep(1 / a.fps)
+    else:
+        r, g, b = parse_color(a.mode)
+        set_rgb(fd, r, g, b, a.intensity)
+except KeyboardInterrupt:
+    print("\nstopped (color held; run 'auto' to hand back to firmware)")

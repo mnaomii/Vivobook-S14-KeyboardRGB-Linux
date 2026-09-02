@@ -1,0 +1,4 @@
+# ASUS ITE5570 keyboard RGB (HID LampArray) — let local users drive it.
+# I2C-HID has no USB vendor/product IDs, so match the I2C controller name.
+KERNEL=="hidraw*", SUBSYSTEM=="hidraw", ATTRS{name}=="ITE5570:00", \
+    MODE="0660", GROUP="plugdev", TAG+="uaccess"
