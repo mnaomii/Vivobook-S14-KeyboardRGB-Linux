@@ -18,6 +18,7 @@ does the talking.
 | `systemd/kbdrgb.service` | User service so the daemon comes back at login. |
 | `udev/99-asus-kbd-rgb.rules` | Grants the local user write access to the hidraw node. |
 | `applications/kbdrgb.desktop` | App launcher entry for the GUI. |
+| `install.sh` | Installs or uninstalls all of the above. See [Install](#install). |
 
 ## How it works
 
@@ -111,7 +112,51 @@ to the node without sudo.
 
 ## Install
 
-Requires Python 3, PyGObject, GTK4 and libadwaita. On Debian or Ubuntu:
+Requires Python 3, PyGObject, GTK4 and libadwaita. The CLI only needs Python 3;
+the daemon and the GUI need the rest.
+
+### With the install script
+
+From the root of this repository, as your normal user (not with sudo):
+
+```sh
+./install.sh
+```
+
+It asks for your password only for the steps that touch the system. In order, it:
+
+1. Checks that PyGObject, GTK4 and libadwaita import. If not, and `apt-get` is
+   available, it installs `python3-gi gir1.2-gtk-4.0 gir1.2-adw-1`. On other
+   distros it says what is missing and carries on.
+2. Copies `kbdrgb`, `kbdrgbd` and `kbdrgb-gui` to `~/.local/bin`, the launcher to
+   `~/.local/share/applications`, and the unit to `~/.config/systemd/user`.
+3. Installs the udev rule to `/etc/udev/rules.d` and reloads udev for hidraw
+   devices (sudo).
+4. Enables `kbdrgb.service` and (re)starts it, so running the script again after
+   pulling changes picks up the new daemon.
+5. Warns if `~/.local/bin` is not on PATH.
+
+Options:
+
+| Option | Effect |
+| --- | --- |
+| `--uninstall` | Stops and disables the service, removes every installed file and the udev rule. Leaves `~/.config/kbdrgb/` alone. |
+| `--skip-deps` | Skips the dependency check and apt install. |
+| `--no-udev` | Skips the udev rule, so nothing runs with sudo. |
+| `--no-service` | Installs the unit but does not enable or start it. |
+| `-h`, `--help` | Prints usage. |
+
+`PREFIX=/some/path ./install.sh` installs `bin/` and `share/applications/` under
+another prefix instead of `~/.local`. The installed unit's `ExecStart` is
+rewritten to match. Pass the same `PREFIX` to `--uninstall`.
+
+If the script is run without a systemd user session (over plain ssh, say), it
+installs the files and prints the `systemctl --user` commands to run later from
+the desktop session.
+
+### By hand
+
+Install the dependencies. On Debian or Ubuntu:
 
 ```sh
 sudo apt install python3-gi gir1.2-gtk-4.0 gir1.2-adw-1
